@@ -1,38 +1,15 @@
----
-title: Customer Relationship Environment Server
-emoji: "💼"
-colorFrom: indigo
-colorTo: blue
-sdk: docker
-pinned: false
-app_port: 8000
-base_path: /web
-tags:
-  - openenv
----
+
 
 # Customer Relationship Management (VRM) Environment
 
 This OpenEnv environment simulates real fintech customer-relationship operations to improve customer satisfaction and NPS outcomes under operational/compliance constraints.
 
-## Project location
-
-The project is located at:
-
-`/Users/laalinib68gmail.com/customer_relationship_env`
-
 ## Real-world scope
 
-Tasks mirror actual support workflows (not games):
+Tasks mirror actual support workflows :
 - card fraud containment,
 - fee dispute + retention,
 - SMB payment-failure churn prevention.
-
-## OpenEnv spec compliance
-
-- Typed `Action`/`Observation` models in `models.py`.
-- `step()`, `reset()`, and `state` in `server/customer_relationship_environment.py`.
-- `openenv.yaml` manifest and FastAPI app in `server/app.py`.
 
 ## Agent architecture
 
