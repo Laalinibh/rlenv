@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dotenv import load_dotenv, find_dotenv
+_ = load_dotenv(find_dotenv())
+
 try:
     from openenv.core.env_server.http_server import create_app
 except ImportError as e:  # pragma: no cover

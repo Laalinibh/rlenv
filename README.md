@@ -1,4 +1,14 @@
 
+---
+title: Customer Relationship VRM Environment
+emoji: 🤝
+colorFrom: blue
+colorTo: green
+sdk: docker
+tags:
+  - openenv
+pinned: false
+---
 
 # Customer Relationship Management (VRM) Environment
 
