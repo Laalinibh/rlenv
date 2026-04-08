@@ -6,7 +6,6 @@ MANDATORY ENV VARS
 
 Optional fallback
 - OPENAI_API_KEY
-- ENV_BASE_URL (default: http://localhost:8000)
 """
 
 from __future__ import annotations
@@ -15,13 +14,17 @@ import json
 import os
 from typing import Dict, List
 
-import requests
 from openai import OpenAI
 
+from dotenv import load_dotenv, find_dotenv
+_ = load_dotenv(find_dotenv())
+
+from server.customer_relationship_environment import CustomerRelationshipEnvironment
+from models import CRMAction
+
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000")
 
 MAX_STEPS = 10
 TRAJECTORIES_PER_TASK = 3
@@ -32,6 +35,29 @@ TASKS = [
     "medium_dispute_retention",
     "hard_business_churn_prevention",
 ]
+
+TASK_INFO = {
+    "easy_card_freeze": {
+        "expected_intent": "card_fraud",
+        "required_workflows": ["verify_identity", "freeze_card"],
+        "optional_workflows": ["reissue_card"],
+    },
+    "medium_dispute_retention": {
+        "expected_intent": "fee_dispute",
+        "required_workflows": ["verify_identity", "refund_dispute", "waive_fee"],
+        "optional_workflows": ["offer_savings"],
+    },
+    "hard_business_churn_prevention": {
+        "expected_intent": "payment_failure",
+        "required_workflows": ["verify_identity", "refund_dispute", "offer_savings"],
+        "optional_workflows": ["waive_fee"],
+    },
+}
+
+VALID_ACTION_TYPES = {"analyze", "respond", "workflow", "finalize", "handoff"}
+VALID_WORKFLOWS = {"verify_identity", "freeze_card", "reissue_card", "refund_dispute", "offer_savings", "waive_fee", "none"}
+VALID_EVENT_TYPES = {"clarifying_q", "suggestion", "confirmation", "handoff", "escalation_trigger", "repair_moment", "tool_failure", "auth_checkpoint", "compliance_disclosure"}
+ALLOWED_KEYS = {"action_type", "rationale", "response_text", "intent", "workflow", "extracted_slots", "confidence", "event_type", "tool_status", "metadata"}
 
 
 def require_env() -> None:
@@ -44,31 +70,130 @@ def require_env() -> None:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
-def call_reset(task_id: str) -> Dict:
-    r = requests.post(f"{ENV_BASE_URL}/reset", json={"task_id": task_id}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def obs_to_dict(obs) -> Dict:
+    """Convert CRMObservation to the dict format matching the HTTP API."""
+    obs_dict = obs.model_dump(exclude={"reward", "done", "metadata"})
+    return {
+        "observation": obs_dict,
+        "reward": obs.reward,
+        "done": obs.done,
+        "metadata": obs.metadata,
+    }
 
 
-def call_step(action: Dict) -> Dict:
-    r = requests.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def sanitize_action(raw: Dict) -> Dict:
+    """Strip unknown keys and normalise enum values to match CRMAction schema."""
+    action = {k: v for k, v in raw.items() if k in ALLOWED_KEYS}
+
+    if action.get("action_type") not in VALID_ACTION_TYPES:
+        action["action_type"] = "respond"
+    if action.get("workflow") not in VALID_WORKFLOWS:
+        action["workflow"] = "none"
+    evt = action.get("event_type")
+    if evt is not None and evt not in VALID_EVENT_TYPES:
+        action["event_type"] = None
+
+    try:
+        action["confidence"] = max(0.0, min(1.0, float(action.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        action["confidence"] = 0.5
+
+    if not isinstance(action.get("extracted_slots"), dict):
+        action["extracted_slots"] = {}
+    else:
+        action["extracted_slots"] = {
+            k: str(v) for k, v in action["extracted_slots"].items()
+            if v is not None and str(v).strip()
+        }
+
+    return action
 
 
-def build_prompt(obs: Dict) -> str:
-    ob = obs.get("observation", {})
+def simulate_customer(client: OpenAI, task_id: str, agent_message: str, missing_slots: List[str]) -> str:
+    """LLM call simulating a customer who responds with the required slot values."""
+    if not missing_slots or not agent_message:
+        return ""
+
+    slot_hints = {
+        "customer_id": "a customer ID like C-98210",
+        "last4_card": "the last 4 digits of your card like 4532",
+        "disputed_amount": "a dollar amount like $47.99",
+        "month": "a month like March 2024",
+        "company_name": "a business name like Greenfield Logistics",
+        "incident_count": "a count like 3",
+        "payroll_date": "a date like 2024-03-15",
+    }
+    slot_desc = ", ".join(f"{s} ({slot_hints.get(s, s)})" for s in missing_slots)
+
+    prompt = (
+        f"You are a customer calling fintech support about: {task_id.replace('_', ' ')}.\n"
+        f"The agent just said: \"{agent_message}\"\n\n"
+        f"Respond naturally as a concerned customer. Include these details in your reply: {slot_desc}.\n"
+        "Keep it to 1-3 sentences."
+    )
+    msg = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=0.3,
+        max_tokens=150,
+        messages=[
+            {"role": "system", "content": "You are simulating a fintech customer. Respond naturally with the requested information."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (msg.choices[0].message.content or "").strip()
+
+
+def build_prompt(obs_dict: Dict, task_id: str, customer_reply: str = "") -> str:
+    ob = obs_dict.get("observation", {})
+    meta = obs_dict.get("metadata", {})
     task = ob.get("task", {})
+    collected = ob.get("collected_slots", {})
+    required = ob.get("required_slots", [])
+    outstanding = ob.get("outstanding_risks", [])
+    workflows_taken = ob.get("workflow_actions_taken", [])
+    conversation = ob.get("conversation_history", [])
+    customer_msg = ob.get("customer_message", "")
+
+    info = TASK_INFO[task_id]
+    missing_slots = [s for s in required if s not in collected]
+    done_wfs = set(workflows_taken)
+    pending_wfs = [w for w in info["required_workflows"] if w not in done_wfs]
+
+    customer_context = f"Latest customer reply: \"{customer_reply}\"\n" if customer_reply else ""
+
     return (
-        "You are a fintech VRM agent. Produce one JSON action. "
-        "Priorities: gather missing slots, execute required workflows, then finalize.\n"
+        "You are a fintech VRM agent operating in a SIMULATED environment.\n\n"
+        "STRATEGY — do exactly ONE of these per step, in order:\n"
+        f"1. FIRST STEP ONLY: Use action_type='analyze' with intent='{info['expected_intent']}' "
+        "and extract any slots you can from the customer message into extracted_slots.\n"
+        "2. If there are missing slots, use action_type='respond' to ask the customer, "
+        "then extract slot values from the customer's reply into extracted_slots.\n"
+        "3. Once slots are collected, execute EACH required workflow one at a time with "
+        "action_type='workflow' and set the workflow field (e.g. 'verify_identity').\n"
+        "4. After ALL required workflows are done, use action_type='finalize'.\n\n"
         f"Task: {json.dumps(task)}\n"
-        f"Collected slots: {json.dumps(ob.get('collected_slots', {}))}\n"
-        f"Required slots: {json.dumps(ob.get('required_slots', []))}\n"
-        f"Workflows taken: {json.dumps(ob.get('workflow_actions_taken', []))}\n"
-        f"Outstanding risks: {json.dumps(ob.get('outstanding_risks', []))}\n"
-        f"NPS proxy: {ob.get('nps_proxy')}\n"
-        "Output JSON with keys: action_type, rationale, response_text, intent, workflow, extracted_slots, confidence, event_type, tool_status"
+        f"Expected intent: {info['expected_intent']}\n"
+        f"Customer opening: {customer_msg}\n"
+        f"{customer_context}"
+        f"Conversation so far ({len(conversation)} turns): {json.dumps(conversation[-6:])}\n"
+        f"Collected slots: {json.dumps(collected)}\n"
+        f"Missing slots: {json.dumps(missing_slots)}\n"
+        f"Required workflows: {json.dumps(info['required_workflows'])}\n"
+        f"Workflows done: {json.dumps(workflows_taken)}\n"
+        f"Pending workflows: {json.dumps(pending_wfs)}\n"
+        f"Optional workflows (bonus): {json.dumps(info['optional_workflows'])}\n"
+        f"NPS proxy: {ob.get('nps_proxy')}\n\n"
+        "Output ONLY a JSON object with these exact keys:\n"
+        "- action_type: one of [analyze, respond, workflow, finalize, handoff]\n"
+        "- rationale: string\n"
+        "- response_text: customer-facing message (use words like 'verify', 'secure', 'confirm', 'next')\n"
+        f"- intent: '{info['expected_intent']}'\n"
+        "- workflow: one of [verify_identity, freeze_card, reissue_card, refund_dispute, offer_savings, waive_fee, none]\n"
+        "- extracted_slots: object of slot key-value pairs from customer's reply\n"
+        "- confidence: float 0.0-1.0\n"
+        "- event_type: one of [clarifying_q, suggestion, confirmation, handoff, escalation_trigger, repair_moment, tool_failure, auth_checkpoint, compliance_disclosure] or null\n"
+        "- tool_status: one of [ok, failed, timeout]\n"
+        "Do NOT include any extra keys."
     )
 
 
@@ -76,20 +201,21 @@ def llm_action(client: OpenAI, prompt: str) -> Dict:
     msg = client.chat.completions.create(
         model=MODEL_NAME,
         temperature=TEMPERATURE,
-        max_tokens=280,
+        max_tokens=512,
         messages=[
             {"role": "system", "content": "Return only valid JSON."},
             {"role": "user", "content": prompt},
         ],
     )
     text = msg.choices[0].message.content or "{}"
+    parsed_text = text.replace("```json", "").replace("```", "").strip()
     try:
-        return json.loads(text)
+        return json.loads(parsed_text)
     except json.JSONDecodeError:
         return {
             "action_type": "respond",
             "rationale": "Fallback due to parse failure",
-            "response_text": "I understand the urgency. I will verify your identity and take the required secure action now.",
+            "response_text": "I understand the urgency. Let me verify your identity and take the required secure action now.",
             "intent": "",
             "workflow": "none",
             "extracted_slots": {},
@@ -100,21 +226,38 @@ def llm_action(client: OpenAI, prompt: str) -> Dict:
 
 
 def run_trajectory(client: OpenAI, task_id: str) -> float:
-    obs = call_reset(task_id)
-    last = obs
-    for _ in range(MAX_STEPS):
-        prompt = build_prompt(last)
-        action = llm_action(client, prompt)
-        last = call_step(action)
+    env = CustomerRelationshipEnvironment()
+    obs = env.reset(task_id=task_id)
+    last = obs_to_dict(obs)
+    customer_reply = ""
+
+    for step in range(MAX_STEPS):
+        prompt = build_prompt(last, task_id, customer_reply)
+        raw_action = sanitize_action(llm_action(client, prompt))
+        print(f"  step={step+1} action_type={raw_action.get('action_type')} "
+              f"workflow={raw_action.get('workflow')} "
+              f"slots={raw_action.get('extracted_slots')}")
+
+        action = CRMAction.model_validate(raw_action)
+        obs = env.step(action)
+        last = obs_to_dict(obs)
+
         if last.get("done", False):
             break
 
-    grade = (
-        last.get("observation", {})
-        .get("metadata", {})
-        .get("grade", {})
-        .get("score", 0.0)
-    )
+        # Simulate customer response if agent asked for info
+        ob = last.get("observation", {})
+        missing_slots = [s for s in ob.get("required_slots", [])
+                         if s not in ob.get("collected_slots", {})]
+        if missing_slots and raw_action.get("action_type") == "respond":
+            customer_reply = simulate_customer(
+                client, task_id, raw_action.get("response_text", ""), missing_slots
+            )
+            print(f"  customer_sim: {customer_reply}")
+        else:
+            customer_reply = ""
+
+    grade = last.get("metadata", {}).get("grade", {}).get("score", 0.0)
     return float(grade)
 
 
