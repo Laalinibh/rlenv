@@ -12,7 +12,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Dict, List
+
+# Force unbuffered output — critical for Docker/subprocess capture
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
 
 from openai import OpenAI
 
@@ -22,6 +27,7 @@ _ = load_dotenv(find_dotenv())
 from server.customer_relationship_environment import CustomerRelationshipEnvironment
 from models import CRMAction
 
+BENCHMARK = "customer_relationship"
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
@@ -58,6 +64,37 @@ VALID_ACTION_TYPES = {"analyze", "respond", "workflow", "finalize", "handoff"}
 VALID_WORKFLOWS = {"verify_identity", "freeze_card", "reissue_card", "refund_dispute", "offer_savings", "waive_fee", "none"}
 VALID_EVENT_TYPES = {"clarifying_q", "suggestion", "confirmation", "handoff", "escalation_trigger", "repair_moment", "tool_failure", "auth_checkpoint", "compliance_disclosure"}
 ALLOWED_KEYS = {"action_type", "rationale", "response_text", "intent", "workflow", "extracted_slots", "confidence", "event_type", "tool_status", "metadata"}
+
+
+# ── Structured log helpers (mandatory [START]/[STEP]/[END] format) ──
+
+def log_start(task: str, model: str) -> None:
+    line = "[START] task=%s env=%s model=%s" % (task, BENCHMARK, model)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: str | None = None) -> None:
+    reward = max(0.0051, min(0.9949, float(reward)))
+    err = str(error)[:60] if error else "null"
+    done_s = "true" if done else "false"
+    line = "[STEP] step=%d action=%s reward=%.2f done=%s error=%s" % (
+        step, action, reward, done_s, err)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    if not rewards:
+        rewards = [0.01]
+    rewards = [max(0.0051, min(0.9949, float(r))) for r in rewards]
+    score = max(0.0051, min(0.9949, float(score)))
+    rstr = ",".join("%.2f" % r for r in rewards)
+    succ = "true" if success else "false"
+    line = "[END] success=%s steps=%d score=%.2f rewards=%s" % (
+        succ, steps, score, rstr)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
 
 
 def require_env() -> None:
@@ -226,39 +263,73 @@ def llm_action(client: OpenAI, prompt: str) -> Dict:
 
 
 def run_trajectory(client: OpenAI, task_id: str) -> float:
-    env = CustomerRelationshipEnvironment()
-    obs = env.reset(task_id=task_id)
-    last = obs_to_dict(obs)
-    customer_reply = ""
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
 
-    for step in range(MAX_STEPS):
-        prompt = build_prompt(last, task_id, customer_reply)
-        raw_action = sanitize_action(llm_action(client, prompt))
-        print(f"  step={step+1} action_type={raw_action.get('action_type')} "
-              f"workflow={raw_action.get('workflow')} "
-              f"slots={raw_action.get('extracted_slots')}")
+    log_start(task_id, MODEL_NAME)
 
-        action = CRMAction.model_validate(raw_action)
-        obs = env.step(action)
+    try:
+        env = CustomerRelationshipEnvironment()
+        obs = env.reset(task_id=task_id)
         last = obs_to_dict(obs)
+        customer_reply = ""
 
-        if last.get("done", False):
-            break
+        for step_num in range(1, MAX_STEPS + 1):
+            err_str = None
+            try:
+                prompt = build_prompt(last, task_id, customer_reply)
+                raw_action = sanitize_action(llm_action(client, prompt))
+                act_str = raw_action.get("action_type", "unknown")
 
-        # Simulate customer response if agent asked for info
-        ob = last.get("observation", {})
-        missing_slots = [s for s in ob.get("required_slots", [])
-                         if s not in ob.get("collected_slots", {})]
-        if missing_slots and raw_action.get("action_type") == "respond":
-            customer_reply = simulate_customer(
-                client, task_id, raw_action.get("response_text", ""), missing_slots
-            )
-            print(f"  customer_sim: {customer_reply}")
-        else:
-            customer_reply = ""
+                action = CRMAction.model_validate(raw_action)
+                obs = env.step(action)
+                last = obs_to_dict(obs)
 
-    grade = last.get("metadata", {}).get("grade", {}).get("score", 0.0)
-    return float(grade)
+                reward = float(last.get("reward", 0.0))
+                done = bool(last.get("done", False))
+            except Exception as ex:
+                reward = 0.0
+                done = True
+                act_str = raw_action.get("action_type", "unknown") if 'raw_action' in dir() else "error"
+                err_str = str(ex)[:50]
+
+            rewards.append(reward)
+            steps_taken = step_num
+            log_step(step_num, act_str, reward, done, err_str)
+
+            if done:
+                break
+
+            # Simulate customer response if agent asked for info
+            ob = last.get("observation", {})
+            missing_slots = [s for s in ob.get("required_slots", [])
+                             if s not in ob.get("collected_slots", {})]
+            if missing_slots and raw_action.get("action_type") == "respond":
+                customer_reply = simulate_customer(
+                    client, task_id, raw_action.get("response_text", ""), missing_slots
+                )
+            else:
+                customer_reply = ""
+
+        grade = last.get("metadata", {}).get("grade", {}).get("score", 0.0)
+        score = float(grade)
+        success = score >= 0.5
+
+    except Exception as ex:
+        err = str(ex)[:50]
+        if steps_taken == 0:
+            rewards = [0.0]
+            steps_taken = 1
+            log_step(1, "none", 0.0, True, err)
+        score = round(sum(rewards) / len(rewards), 4) if rewards else 0.0
+        success = False
+
+    finally:
+        log_end(success, steps_taken, score, rewards)
+
+    return score
 
 
 def main() -> None:

@@ -26,7 +26,9 @@ def test_grader_score_range():
         used_handoff=False,
         step_count=4,
         max_steps=10,
-        avg_response_quality=0.9,
+        usefulness_100=75.0,
+        tool_failures=0,
+        repair_loops=0,
     )
     assert 0.0 <= result.score <= 1.0
 
