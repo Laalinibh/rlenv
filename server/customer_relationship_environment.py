@@ -37,8 +37,8 @@ except ImportError:
         TaskDefinition,
         TurnUsefulness,
     )
-    from graders import CRMTaskGrader
-    from task_bank import TASKS, CRMTaskSpec
+    from server.graders import CRMTaskGrader
+    from server.task_bank import TASKS, CRMTaskSpec
 
 
 class CustomerRelationshipEnvironment(Environment):

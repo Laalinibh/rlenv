@@ -60,21 +60,25 @@ _install_openenv_stubs()
 
 def load_env_module():
     """Load the environment module directly, bypassing server/__init__.py"""
-    # Pre-load dependencies so the except-block bare imports work
+    # Pre-load dependencies so the except-block imports work
     load_models_module()
+    # Ensure 'server' package exists in sys.modules
+    if "server" not in sys.modules:
+        import types as _t
+        sys.modules["server"] = _t.ModuleType("server")
     # Load task_bank
     tb_path = Path(__file__).parent / "server" / "task_bank.py"
-    tb_spec = importlib.util.spec_from_file_location("task_bank", tb_path)
+    tb_spec = importlib.util.spec_from_file_location("server.task_bank", tb_path)
     tb_mod = importlib.util.module_from_spec(tb_spec)
     assert tb_spec and tb_spec.loader
-    sys.modules["task_bank"] = tb_mod
+    sys.modules["server.task_bank"] = tb_mod
     tb_spec.loader.exec_module(tb_mod)
     # Load graders
     gr_path = Path(__file__).parent / "server" / "graders.py"
-    gr_spec = importlib.util.spec_from_file_location("graders", gr_path)
+    gr_spec = importlib.util.spec_from_file_location("server.graders", gr_path)
     gr_mod = importlib.util.module_from_spec(gr_spec)
     assert gr_spec and gr_spec.loader
-    sys.modules["graders"] = gr_mod
+    sys.modules["server.graders"] = gr_mod
     gr_spec.loader.exec_module(gr_mod)
     # Load environment
     env_path = Path(__file__).parent / "server" / "customer_relationship_environment.py"
