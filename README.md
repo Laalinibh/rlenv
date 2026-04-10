@@ -77,6 +77,10 @@ flowchart TD
 `CRMObservation` exposes:
 - task spec (`task_id`, difficulty, objective, max steps)
 - slot state, workflow trace, risk/outstanding requirements
+- `account_context`: full customer profile (tier, LTV, NPS, tenure, risk flags)
+- `compliance_policies`: regulatory policies the agent must follow (e.g. Reg E, NACHA, retention guardrails)
+- `prior_interactions`: recent support history with satisfaction ratings
+- `knowledge_base`: relevant articles the agent can reference
 - `turn_usefulness` rubric + normalized score
 - `session_satisfaction_hat` (calibrated satisfaction probability)
 - `critical_event_impacts` (per-event average delta in satisfaction)
@@ -89,6 +93,15 @@ flowchart TD
 3. `hard_business_churn_prevention` (hard)
 
 Grader in `server/graders.py` returns deterministic score in `[0.0, 1.0]`.
+
+Grade components and weights:
+- **intent** (14%): correct intent classification
+- **slots** (20%): required slot collection
+- **workflow** (19%): required/optional workflow completion
+- **satisfaction_hat** (14%): session satisfaction proxy
+- **usefulness** (8%): average turn usefulness
+- **efficiency** (6%): step count and tool failure penalties
+- **compliance** (12%): regulatory disclosures, auth checkpoints, policy coverage (boosted for high-risk tasks)
 
 ## Scoring formulas aligned to your framework
 
@@ -125,10 +138,11 @@ This is tracked online as `critical_event_impacts`.
 ## Reward shaping
 
 Dense reward combines:
-- partial progress: intent, slots, required workflows,
-- usefulness uplift and satisfaction proxy impact,
-- penalties: handoff misuse, tool failure, loops/max-step, high-risk unverified flow,
-- terminal adjustment with deterministic grader score.
+- partial progress: intent, slots, required workflows
+- compliance signals: disclosures (+0.04), auth checkpoints (+0.03), policy keyword mentions (+0.05)
+- usefulness uplift and satisfaction proxy impact
+- penalties: handoff misuse, tool failure, loops/max-step, high-risk unverified flow
+- terminal adjustment with deterministic grader score
 
 ## How the agent works
 
@@ -153,24 +167,24 @@ Metadata includes notes for:
 ## Setup
 
 ```bash
-cd customer_relationship_env
+cd rlenv
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-uvicorn server.app:app --host 0.0.0.0 --port 8000
+uvicorn server.app:app --host 0.0.0.0 --port 7860
 ```
 
 Health check:
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:7860/health
 ```
 
 ## Docker
 
 ```bash
-docker build -t customer-relationship-env:latest -f server/Dockerfile .
-docker run --rm -p 8000:8000 customer-relationship-env:latest
+docker build -t customer-relationship-env:latest .
+docker run --rm -p 7860:7860 customer-relationship-env:latest
 ```
 
 ## Hugging Face Spaces deploy
@@ -193,7 +207,7 @@ Run it:
 export API_BASE_URL="https://router.huggingface.co/v1"
 export MODEL_NAME="your-model-id"
 export HF_TOKEN="your-token"
-export ENV_BASE_URL="http://localhost:8000"
+export ENV_BASE_URL="http://localhost:7860"
 python inference.py
 ```
 
