@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
@@ -9,11 +9,15 @@ from openenv.core.env_server.types import State
 
 try:
     from ..models import (
+        AccountContext,
         CRMAction,
         CRMActionType,
         CRMObservation,
         CRMWorkflowType,
         CriticalEventType,
+        InteractionRecord,
+        KnowledgeArticle,
+        PolicyInfo,
         TaskDefinition,
         TurnUsefulness,
     )
@@ -21,16 +25,20 @@ try:
     from .task_bank import TASKS, CRMTaskSpec
 except ImportError:
     from models import (
+        AccountContext,
         CRMAction,
         CRMActionType,
         CRMObservation,
         CRMWorkflowType,
         CriticalEventType,
+        InteractionRecord,
+        KnowledgeArticle,
+        PolicyInfo,
         TaskDefinition,
         TurnUsefulness,
     )
-    from server.graders import CRMTaskGrader
-    from server.task_bank import TASKS, CRMTaskSpec
+    from graders import CRMTaskGrader
+    from task_bank import TASKS, CRMTaskSpec
 
 
 class CustomerRelationshipEnvironment(Environment):
@@ -54,6 +62,9 @@ class CustomerRelationshipEnvironment(Environment):
 
         self._event_deltas: Dict[str, List[float]] = defaultdict(list)
         self._last_turn_usefulness = TurnUsefulness()
+        self._compliance_disclosures: int = 0
+        self._auth_checkpoints: int = 0
+        self._mentioned_policies: Set[str] = set()
 
     def reset(self, seed=None, episode_id=None, **kwargs) -> CRMObservation:
         task_id = kwargs.get("task_id") or "easy_card_freeze"
@@ -76,6 +87,9 @@ class CustomerRelationshipEnvironment(Environment):
         self._repair_loops = 0
         self._event_deltas = defaultdict(list)
         self._last_turn_usefulness = TurnUsefulness()
+        self._compliance_disclosures = 0
+        self._auth_checkpoints = 0
+        self._mentioned_policies = set()
 
         return self._obs(reward=0.0, done=False, done_reason=None)
 
@@ -141,6 +155,30 @@ class CustomerRelationshipEnvironment(Environment):
             reward -= 0.06
         if "sorry" in action.response_text.lower() or "correct" in action.response_text.lower():
             self._repair_loops += 1
+
+        # Compliance-awareness tracking
+        if action.event_type == CriticalEventType.COMPLIANCE_DISCLOSURE:
+            self._compliance_disclosures += 1
+            reward += 0.04
+        if action.event_type == CriticalEventType.AUTH_CHECKPOINT:
+            self._auth_checkpoints += 1
+            reward += 0.03
+
+        # Policy-aware response bonus: check if agent references policy concepts
+        text_lower = action.response_text.lower()
+        for policy in (self._task.compliance_policies if self._task else []):
+            pid = policy.policy_id
+            if pid not in self._mentioned_policies:
+                # Check if agent's response shows awareness of the policy
+                policy_keywords = set(policy.requirement.lower().split()) - {
+                    "the", "a", "an", "is", "to", "of", "and", "or", "in", "for",
+                    "must", "may", "not", "be", "that", "with", "this", "from",
+                }
+                # Agent gets credit for mentioning 3+ relevant keywords from a policy
+                matches = sum(1 for kw in policy_keywords if len(kw) > 4 and kw in text_lower)
+                if matches >= 3:
+                    self._mentioned_policies.add(pid)
+                    reward += 0.05
 
         # Turn-level usefulness formula from requirements
         turn = self._compute_turn_usefulness(action)
@@ -211,6 +249,11 @@ class CustomerRelationshipEnvironment(Environment):
             usefulness_100=self._avg_usefulness_100(),
             tool_failures=self._tool_failures,
             repair_loops=self._repair_loops,
+            compliance_disclosures=self._compliance_disclosures,
+            auth_checkpoints=self._auth_checkpoints,
+            policies_referenced=len(self._mentioned_policies),
+            total_policies=len(self._task.compliance_policies),
+            high_risk=self._task.high_risk,
         )
         data = {"score": result.score}
         data.update(result.breakdown)
@@ -218,11 +261,89 @@ class CustomerRelationshipEnvironment(Environment):
 
     def _compute_turn_usefulness(self, action: CRMAction) -> TurnUsefulness:
         text = action.response_text.lower()
-        correctness = 1.8 if action.intent == (self._task.expected_intent if self._task else "") else 1.0
-        completeness = min(2.0, 0.5 + 0.5 * len(action.extracted_slots))
-        clarity = 1.6 if len(action.response_text.split()) > 8 else 1.1
-        actionability = 1.7 if any(k in text for k in ["next", "please", "confirm", "verify"]) else 1.0
-        safety = 1.8 if any(k in text for k in ["secure", "identity", "policy", "consent"]) else 1.0
+        words = action.response_text.split()
+        word_count = len(words)
+
+        # === Correctness (0-2): intent match + slot relevance + workflow appropriateness ===
+        intent_correct = action.intent == (self._task.expected_intent if self._task else "")
+        slots_provided = len(action.extracted_slots)
+        slots_relevant = sum(
+            1 for s in action.extracted_slots
+            if self._task and s in self._task.required_slots
+        )
+        correctness = 0.5
+        if intent_correct:
+            correctness += 0.8
+        if slots_relevant > 0:
+            correctness += min(0.5, slots_relevant * 0.25)
+        if action.action_type == CRMActionType.WORKFLOW and action.workflow.value != "none":
+            wf = action.workflow.value
+            if self._task and wf in self._task.required_workflows:
+                correctness += 0.2
+        correctness = min(2.0, correctness)
+
+        # === Completeness (0-2): slots extracted + conversation progression ===
+        completeness = 0.3
+        completeness += min(0.7, slots_provided * 0.35)
+        if action.rationale and len(action.rationale) > 10:
+            completeness += 0.3
+        if action.response_text and word_count > 5:
+            completeness += 0.3
+        # Bonus for addressing outstanding risks
+        if self._task:
+            outstanding = [s for s in self._task.required_slots if s not in self._collected_slots]
+            if action.action_type == CRMActionType.RESPOND and outstanding:
+                completeness += 0.3  # asking for missing info
+        completeness = min(2.0, completeness)
+
+        # === Clarity (0-2): response length, structure, specificity ===
+        clarity = 0.4
+        if 8 < word_count < 80:
+            clarity += 0.6  # right length — not too terse, not rambling
+        elif word_count >= 5:
+            clarity += 0.3
+        # Contains specific numbers, dates, or IDs (shows specificity)
+        if any(c.isdigit() for c in action.response_text):
+            clarity += 0.3
+        # Uses structured sentence patterns
+        if any(p in text for p in ["i will", "i'll", "let me", "here's what", "first,"]):
+            clarity += 0.3
+        clarity = min(2.0, clarity)
+
+        # === Actionability (0-2): does the response move the episode forward? ===
+        actionability = 0.4
+        if action.action_type in (CRMActionType.WORKFLOW, CRMActionType.FINALIZE):
+            actionability += 0.8  # concrete action
+        if any(k in text for k in ["next step", "please provide", "confirm", "verify", "process"]):
+            actionability += 0.4
+        if action.confidence >= 0.7:
+            actionability += 0.2
+        # Penalize vague/empty responses
+        if word_count < 3 and action.action_type == CRMActionType.RESPOND:
+            actionability = max(0.0, actionability - 0.5)
+        actionability = min(2.0, actionability)
+
+        # === Safety/Compliance (0-2): policy adherence signals ===
+        safety = 0.4
+        # Identity verification awareness
+        if any(k in text for k in ["identity", "verify", "authenticate", "security"]):
+            safety += 0.4
+        # Policy/compliance references
+        if any(k in text for k in ["policy", "regulation", "compliance", "disclosure", "consent"]):
+            safety += 0.4
+        # Proper event type usage
+        if action.event_type in (CriticalEventType.AUTH_CHECKPOINT, CriticalEventType.COMPLIANCE_DISCLOSURE):
+            safety += 0.4
+        # Acknowledging high-risk context
+        if self._task and self._task.high_risk:
+            if any(k in text for k in ["urgent", "priority", "immediately", "right away", "protect"]):
+                safety += 0.2
+        # Penalize dangerous omissions: workflow without prior auth
+        if (action.action_type == CRMActionType.WORKFLOW
+                and "verify_identity" not in self._workflows
+                and self._task and self._task.high_risk):
+            safety = max(0.0, safety - 0.6)
+        safety = min(2.0, safety)
 
         usefulness = CRMTaskGrader.normalized_usefulness(
             correctness=correctness,
@@ -252,18 +373,54 @@ class CustomerRelationshipEnvironment(Environment):
         outstanding = [s for s in self._task.required_slots if s not in self._collected_slots]
         guidance = (
             "Use structured critical events (clarify/suggest/confirm/handoff/escalation/repair/tool_failure/auth/compliance), "
-            "improve turn-usefulness dimensions, and maximize session satisfaction probability."
+            "improve turn-usefulness dimensions, and maximize session satisfaction probability. "
+            "Consult the compliance_policies and knowledge_base in the observation to inform your responses."
         )
         metadata = {
             "grade": grade,
             "task_id": self._task.task_id,
             "required_workflows": sorted(self._task.required_workflows),
             "optional_workflows": sorted(self._task.optional_workflows),
+            "compliance_score": {
+                "disclosures": self._compliance_disclosures,
+                "auth_checkpoints": self._auth_checkpoints,
+                "policies_referenced": len(self._mentioned_policies),
+                "total_policies": len(self._task.compliance_policies),
+            },
             "evaluation_notes": {
                 "offline_split": ["time_based", "customer_disjoint"],
                 "target_metrics": ["spearman", "mae", "quadratic_weighted_kappa", "roc_auc", "pr_auc", "calibration_error"],
             },
         }
+
+        # Build rich context from task spec
+        profile = self._task.customer_profile
+        account_ctx = AccountContext(
+            customer_name=profile.name,
+            tier=profile.tier,
+            tenure_months=profile.tenure_months,
+            monthly_revenue=profile.monthly_revenue,
+            lifetime_value=profile.lifetime_value,
+            open_tickets=profile.open_tickets,
+            recent_nps=profile.recent_nps,
+            risk_flags=list(profile.risk_flags),
+        )
+        policies = [
+            PolicyInfo(policy_id=p.policy_id, title=p.title, requirement=p.requirement)
+            for p in self._task.compliance_policies
+        ]
+        interactions = [
+            InteractionRecord(
+                date=i.date, channel=i.channel, summary=i.summary,
+                resolution=i.resolution, satisfaction=i.satisfaction,
+            )
+            for i in self._task.prior_interactions
+        ]
+        kb = [
+            KnowledgeArticle(topic=a["topic"], content=a["content"])
+            for a in self._task.knowledge_base
+        ]
+
         return CRMObservation(
             task=TaskDefinition(
                 task_id=self._task.task_id,
@@ -288,6 +445,10 @@ class CustomerRelationshipEnvironment(Environment):
             done=done,
             reward=reward,
             metadata=metadata,
+            account_context=account_ctx,
+            compliance_policies=policies,
+            prior_interactions=interactions,
+            knowledge_base=kb,
         )
 
     @property

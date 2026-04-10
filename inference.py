@@ -191,6 +191,12 @@ def build_prompt(obs_dict: Dict, task_id: str, customer_reply: str = "") -> str:
     conversation = ob.get("conversation_history", [])
     customer_msg = ob.get("customer_message", "")
 
+    # Rich context fields
+    account = ob.get("account_context", {})
+    policies = ob.get("compliance_policies", [])
+    prior = ob.get("prior_interactions", [])
+    kb = ob.get("knowledge_base", [])
+
     info = TASK_INFO[task_id]
     missing_slots = [s for s in required if s not in collected]
     done_wfs = set(workflows_taken)
@@ -198,16 +204,64 @@ def build_prompt(obs_dict: Dict, task_id: str, customer_reply: str = "") -> str:
 
     customer_context = f"Latest customer reply: \"{customer_reply}\"\n" if customer_reply else ""
 
+    # Build account summary
+    account_summary = ""
+    if account and account.get("customer_name"):
+        account_summary = (
+            f"CUSTOMER ACCOUNT:\n"
+            f"  Name: {account['customer_name']} | Tier: {account.get('tier','?')} | "
+            f"Tenure: {account.get('tenure_months',0)} months\n"
+            f"  Monthly Revenue: ${account.get('monthly_revenue',0):.2f} | "
+            f"Lifetime Value: ${account.get('lifetime_value',0):.2f}\n"
+            f"  Open Tickets: {account.get('open_tickets',0)} | Recent NPS: {account.get('recent_nps',0)}\n"
+            f"  Risk Flags: {account.get('risk_flags', [])}\n\n"
+        )
+
+    # Build compliance policies summary
+    policy_summary = ""
+    if policies:
+        policy_lines = []
+        for p in policies:
+            policy_lines.append(f"  [{p.get('policy_id','')}] {p.get('title','')}: {p.get('requirement','')}")
+        policy_summary = "COMPLIANCE POLICIES (you MUST follow these):\n" + "\n".join(policy_lines) + "\n\n"
+
+    # Build prior interactions summary
+    prior_summary = ""
+    if prior:
+        prior_lines = []
+        for ix in prior:
+            prior_lines.append(f"  {ix.get('date','')} ({ix.get('channel','')}) - {ix.get('summary','')} → {ix.get('resolution','')} [{ix.get('satisfaction','')}]")
+        prior_summary = "PRIOR INTERACTIONS:\n" + "\n".join(prior_lines) + "\n\n"
+
+    # Build knowledge base summary
+    kb_summary = ""
+    if kb:
+        kb_lines = []
+        for article in kb:
+            kb_lines.append(f"  [{article.get('topic','')}]: {article.get('content','')}")
+        kb_summary = "KNOWLEDGE BASE:\n" + "\n".join(kb_lines) + "\n\n"
+
     return (
-        "You are a fintech VRM agent operating in a SIMULATED environment.\n\n"
+        "You are a fintech VRM agent operating in a SIMULATED environment.\n"
+        "You have access to the customer's account record, compliance policies, "
+        "prior interaction history, and knowledge base articles. Use them to provide "
+        "informed, policy-compliant responses.\n\n"
+        f"{account_summary}"
+        f"{policy_summary}"
+        f"{prior_summary}"
+        f"{kb_summary}"
         "STRATEGY — do exactly ONE of these per step, in order:\n"
         f"1. FIRST STEP ONLY: Use action_type='analyze' with intent='{info['expected_intent']}' "
-        "and extract any slots you can from the customer message into extracted_slots.\n"
+        "and extract any slots you can from the customer message into extracted_slots. "
+        "Set event_type='auth_checkpoint'.\n"
         "2. If there are missing slots, use action_type='respond' to ask the customer, "
         "then extract slot values from the customer's reply into extracted_slots.\n"
         "3. Once slots are collected, execute EACH required workflow one at a time with "
-        "action_type='workflow' and set the workflow field (e.g. 'verify_identity').\n"
-        "4. After ALL required workflows are done, use action_type='finalize'.\n\n"
+        "action_type='workflow' and set the workflow field (e.g. 'verify_identity'). "
+        "Reference relevant compliance policies in your response_text. "
+        "Set event_type='compliance_disclosure' when mentioning policy requirements.\n"
+        "4. After ALL required workflows are done, use action_type='finalize' with a summary "
+        "that confirms resolution and references any applicable policies.\n\n"
         f"Task: {json.dumps(task)}\n"
         f"Expected intent: {info['expected_intent']}\n"
         f"Customer opening: {customer_msg}\n"
@@ -222,8 +276,8 @@ def build_prompt(obs_dict: Dict, task_id: str, customer_reply: str = "") -> str:
         f"NPS proxy: {ob.get('nps_proxy')}\n\n"
         "Output ONLY a JSON object with these exact keys:\n"
         "- action_type: one of [analyze, respond, workflow, finalize, handoff]\n"
-        "- rationale: string\n"
-        "- response_text: customer-facing message (use words like 'verify', 'secure', 'confirm', 'next')\n"
+        "- rationale: string explaining your reasoning (reference policies/KB when relevant)\n"
+        "- response_text: customer-facing message (use words like 'verify', 'secure', 'confirm', 'next', reference specific policies)\n"
         f"- intent: '{info['expected_intent']}'\n"
         "- workflow: one of [verify_identity, freeze_card, reissue_card, refund_dispute, offer_savings, waive_fee, none]\n"
         "- extracted_slots: object of slot key-value pairs from customer's reply\n"

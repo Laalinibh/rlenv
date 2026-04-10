@@ -69,6 +69,40 @@ class TurnUsefulness(BaseModel):
     normalized_usefulness: float = Field(default=0.0, ge=0.0, le=100.0)
 
 
+class AccountContext(BaseModel):
+    """Customer account data visible to the agent — mirrors a real CRM record."""
+    customer_name: str = ""
+    tier: str = ""
+    tenure_months: int = 0
+    monthly_revenue: float = 0.0
+    lifetime_value: float = 0.0
+    open_tickets: int = 0
+    recent_nps: int = 0
+    risk_flags: List[str] = Field(default_factory=list)
+
+
+class PolicyInfo(BaseModel):
+    """Compliance policy the agent must follow."""
+    policy_id: str = ""
+    title: str = ""
+    requirement: str = ""
+
+
+class InteractionRecord(BaseModel):
+    """Prior support interaction for context."""
+    date: str = ""
+    channel: str = ""
+    summary: str = ""
+    resolution: str = ""
+    satisfaction: str = ""
+
+
+class KnowledgeArticle(BaseModel):
+    """Knowledge base article the agent can reference."""
+    topic: str = ""
+    content: str = ""
+
+
 class CRMObservation(Observation):
     task: TaskDefinition
     customer_message: str = ""
@@ -84,3 +118,8 @@ class CRMObservation(Observation):
     critical_event_impacts: Dict[str, float] = Field(default_factory=dict)
     guidance: str = ""
     done_reason: Optional[str] = None
+    # Rich CRM context fields
+    account_context: AccountContext = Field(default_factory=AccountContext)
+    compliance_policies: List[PolicyInfo] = Field(default_factory=list)
+    prior_interactions: List[InteractionRecord] = Field(default_factory=list)
+    knowledge_base: List[KnowledgeArticle] = Field(default_factory=list)

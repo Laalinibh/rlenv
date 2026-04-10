@@ -88,6 +88,11 @@ class CRMTaskGrader:
         usefulness_100: float,
         tool_failures: int,
         repair_loops: int,
+        compliance_disclosures: int = 0,
+        auth_checkpoints: int = 0,
+        policies_referenced: int = 0,
+        total_policies: int = 0,
+        high_risk: bool = False,
     ) -> GradeResult:
         intent_score = 1.0 if expected_intent and expected_intent in workflows_taken[0:1] else 0.0
 
@@ -106,6 +111,17 @@ class CRMTaskGrader:
         efficiency = max(0.0, 1.0 - (step_count / max(1, max_steps)) * 0.6)
         handoff_penalty = 1.0 if used_handoff else 0.0
 
+        # Compliance score: how well did the agent handle regulatory/policy requirements
+        compliance_score = 0.0
+        if total_policies > 0:
+            compliance_score += 0.4 * min(1.0, policies_referenced / total_policies)
+        compliance_score += 0.3 * min(1.0, compliance_disclosures / max(1, 1 + (1 if high_risk else 0)))
+        compliance_score += 0.3 * min(1.0, auth_checkpoints / 1.0)
+        # High-risk tasks without identity verification get a compliance penalty
+        if high_risk and "verify_identity" not in wf_set:
+            compliance_score = max(0.0, compliance_score - 0.5)
+        compliance_score = max(0.0, min(1.0, compliance_score))
+
         sat_hat = CRMTaskGrader.session_satisfaction_hat(
             task_success=task_success,
             avg_usefulness_01=usefulness_100 / 100.0,
@@ -116,12 +132,13 @@ class CRMTaskGrader:
         )
 
         score = (
-            0.18 * intent_score
-            + 0.24 * slot_score
-            + 0.23 * workflow_score
-            + 0.17 * sat_hat
-            + 0.10 * (usefulness_100 / 100.0)
-            + 0.08 * efficiency
+            0.14 * intent_score
+            + 0.20 * slot_score
+            + 0.19 * workflow_score
+            + 0.14 * sat_hat
+            + 0.08 * (usefulness_100 / 100.0)
+            + 0.06 * efficiency
+            + 0.12 * compliance_score
             + optional_bonus
             - 0.06 * handoff_penalty
         )
@@ -137,6 +154,7 @@ class CRMTaskGrader:
                 "usefulness_100": round(usefulness_100, 4),
                 "sat_hat": round(sat_hat, 4),
                 "efficiency": round(efficiency, 4),
+                "compliance": round(compliance_score, 4),
                 "tool_failures": float(tool_failures),
                 "repair_loops": float(repair_loops),
                 "handoff_penalty": float(handoff_penalty),
