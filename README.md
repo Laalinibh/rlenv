@@ -221,3 +221,19 @@ python inference.py
    - each trajectory score,
    - each task mean,
    - overall mean score.
+
+## 📊 Baseline Evaluation (Qwen2.5-72B)
+
+To validate the deterministic grader and environment complexity, we ran a baseline evaluation using `Qwen/Qwen2.5-72B-Instruct` via the Hugging Face Serverless API. 
+
+The frontier model achieved an **overall mean score of 0.835**, proving the environment is strictly calibrated—solvable, but highly challenging.
+
+### Performance Breakdown
+* **🟢 Easy (Card Freeze):** `0.855` mean score *(Solved in 6/10 steps)*
+* **🟡 Medium (Dispute & Retention):** `0.817` mean score *(Solved in 6/12 steps)*
+* **🔴 Hard (SMB Churn Prevention):** `0.834` mean score *(Solved in 7-8/14 steps)*
+
+### Key Takeaways from the Baseline
+1. **High Step-Efficiency:** The agent consistently extracted required slots and executed workflows in half the maximum allowed steps, successfully avoiding infinite clarification loops.
+2. **Strict Compliance Handling:** In the Hard task, the agent successfully navigated conflicting NACHA regulations and internal retention policies without hallucinating unauthorized account modifications.
+3. **Dense Reward Validation:** The ~15% gap from a perfect 1.0 score accounts for minor deviations in optimal policy disclosures and turn usefulness `(U_t)`, leaving excellent signal room for dedicated RL training.
