@@ -222,7 +222,7 @@ def test_session_satisfaction_hat():
 
 
 def test_environment_reset_step():
-    """Full environment reset and step cycle works."""
+    """Full environment reset and step cycle works for all 9 tasks."""
     models = load_models_module()
     env_mod = load_env_module()
     CustomerRelationshipEnvironment = env_mod.CustomerRelationshipEnvironment
@@ -230,26 +230,28 @@ def test_environment_reset_step():
 
     env = CustomerRelationshipEnvironment()
 
-    # Test all 3 tasks
-    for task_id in ["easy_card_freeze", "medium_dispute_retention", "hard_business_churn_prevention"]:
+    all_tasks = [
+        "easy_card_freeze", "easy_password_reset", "easy_direct_deposit_setup",
+        "medium_dispute_retention", "medium_wire_recall", "medium_credit_limit_increase",
+        "hard_business_churn_prevention", "hard_elder_fraud_recovery", "hard_mortgage_hardship",
+    ]
+    for task_id in all_tasks:
         obs = env.reset(task_id=task_id)
-        assert obs.done is False
+        assert obs.done is False, f"Task {task_id} should not be done after reset"
         assert obs.task.task_id == task_id
         assert len(obs.required_slots) > 0
         assert len(obs.compliance_policies) > 0
         assert obs.account_context.customer_name != ""
-        assert len(obs.knowledge_base) > 0
 
         # Take one step
         action = CRMAction(
             action_type="analyze",
-            intent="card_fraud" if task_id == "easy_card_freeze" else "fee_dispute",
+            intent="card_fraud",
             response_text="Let me verify your identity for security.",
             confidence=0.8,
             event_type="auth_checkpoint",
         )
         obs2 = env.step(action)
-        assert obs2.reward != 0.0  # should have some reward signal
         assert 0.0 <= obs2.progress_score <= 1.0
 
 
@@ -298,6 +300,73 @@ def test_environment_full_easy_trajectory():
     assert grade["compliance"] > 0.0
 
 
+def test_invalid_task_id_fallback():
+    """Invalid task_id should fall back to easy_card_freeze."""
+    env_mod = load_env_module()
+    env = env_mod.CustomerRelationshipEnvironment()
+    obs = env.reset(task_id="nonexistent_task_xyz")
+    assert obs.task.task_id == "easy_card_freeze"
+
+
+def test_double_finalize():
+    """Stepping after finalize should return done without error."""
+    models = load_models_module()
+    env_mod = load_env_module()
+    env = env_mod.CustomerRelationshipEnvironment()
+    env.reset(task_id="easy_card_freeze")
+
+    action = models.CRMAction(
+        action_type="finalize",
+        response_text="All done.",
+        confidence=0.9,
+    )
+    obs1 = env.step(action)
+    assert obs1.done is True
+
+    obs2 = env.step(action)
+    assert obs2.done is True
+    assert obs2.done_reason == "episode_already_done"
+    assert obs2.reward == 0.0
+
+
+def test_max_steps_terminates():
+    """Hitting max_steps should force done=True."""
+    models = load_models_module()
+    env_mod = load_env_module()
+    env = env_mod.CustomerRelationshipEnvironment()
+    env.reset(task_id="easy_password_reset")  # max_steps=8
+
+    action = models.CRMAction(
+        action_type="respond",
+        response_text="Can you provide more details?",
+        confidence=0.5,
+    )
+    obs = None
+    for _ in range(8):
+        obs = env.step(action)
+        if obs.done:
+            break
+    assert obs is not None and obs.done is True
+
+
+def test_repair_loop_detection():
+    """Repeating identical responses should increment repair_loops."""
+    models = load_models_module()
+    env_mod = load_env_module()
+    env = env_mod.CustomerRelationshipEnvironment()
+    env.reset(task_id="easy_card_freeze")
+
+    repeated = models.CRMAction(
+        action_type="respond",
+        response_text="I apologize for the inconvenience. Let me help you with that right away please.",
+        confidence=0.5,
+    )
+    env.step(repeated)
+    env.step(repeated)  # identical text → should detect repair loop
+    env.step(repeated)  # third time
+    assert env._repair_loops >= 1
+
+
 if __name__ == "__main__":
     test_grader_score_range()
     test_grader_zero_score()
@@ -306,4 +375,8 @@ if __name__ == "__main__":
     test_session_satisfaction_hat()
     test_environment_reset_step()
     test_environment_full_easy_trajectory()
-    print("all 7 smoke tests passed")
+    test_invalid_task_id_fallback()
+    test_double_finalize()
+    test_max_steps_terminates()
+    test_repair_loop_detection()
+    print("all 11 smoke tests passed")

@@ -88,9 +88,20 @@ flowchart TD
 
 ## Tasks and deterministic graders
 
-1. `easy_card_freeze` (easy)
-2. `medium_dispute_retention` (medium)
-3. `hard_business_churn_prevention` (hard)
+**Easy** (max 8-10 steps):
+1. `easy_card_freeze` — Freeze compromised debit card after fraud report
+2. `easy_password_reset` — Reset locked online-banking password
+3. `easy_direct_deposit_setup` — Set up direct deposit for new account
+
+**Medium** (max 12 steps):
+4. `medium_dispute_retention` — Resolve fee dispute and retain at-risk customer
+5. `medium_wire_recall` — Recall outgoing domestic wire sent to wrong account
+6. `medium_credit_limit_increase` — Process credit limit increase with FCRA compliance
+
+**Hard** (max 14 steps):
+7. `hard_business_churn_prevention` — Prevent SMB churn after payroll payment failures
+8. `hard_elder_fraud_recovery` — Recover elderly customer's funds after romance scam
+9. `hard_mortgage_hardship` — Process mortgage forbearance with CFPB compliance
 
 Grader in `server/graders.py` returns deterministic score in `[0.0, 1.0]`.
 
@@ -146,12 +157,12 @@ Dense reward combines:
 
 ## How the agent works
 
-The baseline loop in `inference.py` is:
+The baseline loop in `inference.py` communicates with the environment via HTTP:
 
-1. `POST /reset` with `task_id`.
+1. `POST /reset` with `task_id` → environment returns initial observation.
 2. Read observation (required slots, workflows done, risks, current score proxy).
-3. Prompt model to emit a structured `CRMAction`.
-4. `POST /step` with that action.
+3. Prompt model to emit a structured `CRMAction` JSON.
+4. `POST /step` with that action → environment returns next observation.
 5. Repeat until `done=true` or `MAX_STEPS` reached.
 6. Collect final deterministic grade from `observation.metadata.grade.score`.
 
@@ -196,8 +207,10 @@ docker run --rm -p 7860:7860 customer-relationship-env:latest
 
 ## Baseline inference (`inference.py`)
 
-- Uses OpenAI client (as required)
+- Uses OpenAI client via HTTP API (as required)
+- Communicates with environment via `POST /reset` and `POST /step` (configurable via `ENV_BASE_URL`)
 - Reads `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN` (`OPENAI_API_KEY` fallback)
+- **Stochastic customer simulation**: 25% chance per turn that simulated customer omits info, adds emotional tangent, or gives ambiguous answers
 - Runs multiple trajectories per task for reproducible averages
 - Prints per-trajectory, per-task means, and overall mean score
 

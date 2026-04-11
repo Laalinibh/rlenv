@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 from typing import Dict, List
+
+import requests
 
 # Force unbuffered output — critical for Docker/subprocess capture
 if hasattr(sys.stdout, 'reconfigure'):
@@ -24,22 +27,27 @@ from openai import OpenAI
 from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
 
-from server.customer_relationship_environment import CustomerRelationshipEnvironment
-from models import CRMAction
-
 BENCHMARK = "customer_relationship"
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860")
 
 MAX_STEPS = 10
 TRAJECTORIES_PER_TASK = 3
 TEMPERATURE = 0.2
+STOCHASTIC_NOISE = True  # add realistic noise to customer simulation
 
 TASKS = [
     "easy_card_freeze",
+    "easy_password_reset",
+    "easy_direct_deposit_setup",
     "medium_dispute_retention",
+    "medium_wire_recall",
+    "medium_credit_limit_increase",
     "hard_business_churn_prevention",
+    "hard_elder_fraud_recovery",
+    "hard_mortgage_hardship",
 ]
 
 TASK_INFO = {
@@ -48,13 +56,43 @@ TASK_INFO = {
         "required_workflows": ["verify_identity", "freeze_card"],
         "optional_workflows": ["reissue_card"],
     },
+    "easy_password_reset": {
+        "expected_intent": "account_access",
+        "required_workflows": ["verify_identity"],
+        "optional_workflows": ["reissue_card"],
+    },
+    "easy_direct_deposit_setup": {
+        "expected_intent": "account_setup",
+        "required_workflows": ["verify_identity"],
+        "optional_workflows": [],
+    },
     "medium_dispute_retention": {
         "expected_intent": "fee_dispute",
         "required_workflows": ["verify_identity", "refund_dispute", "waive_fee"],
         "optional_workflows": ["offer_savings"],
     },
+    "medium_wire_recall": {
+        "expected_intent": "wire_recall",
+        "required_workflows": ["verify_identity", "refund_dispute"],
+        "optional_workflows": ["offer_savings"],
+    },
+    "medium_credit_limit_increase": {
+        "expected_intent": "credit_limit",
+        "required_workflows": ["verify_identity", "refund_dispute"],
+        "optional_workflows": ["offer_savings"],
+    },
     "hard_business_churn_prevention": {
         "expected_intent": "payment_failure",
+        "required_workflows": ["verify_identity", "refund_dispute", "offer_savings"],
+        "optional_workflows": ["waive_fee"],
+    },
+    "hard_elder_fraud_recovery": {
+        "expected_intent": "elder_fraud",
+        "required_workflows": ["verify_identity", "refund_dispute", "offer_savings"],
+        "optional_workflows": ["waive_fee"],
+    },
+    "hard_mortgage_hardship": {
+        "expected_intent": "mortgage_hardship",
         "required_workflows": ["verify_identity", "refund_dispute", "offer_savings"],
         "optional_workflows": ["waive_fee"],
     },
@@ -107,14 +145,33 @@ def require_env() -> None:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
-def obs_to_dict(obs) -> Dict:
-    """Convert CRMObservation to the dict format matching the HTTP API."""
-    obs_dict = obs.model_dump(exclude={"reward", "done", "metadata"})
+# ── HTTP environment client ──
+
+def env_reset(session: requests.Session, task_id: str) -> Dict:
+    """POST /reset to the environment server and return the parsed result."""
+    resp = session.post(f"{ENV_BASE_URL}/reset", json={"task_id": task_id}, timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+    obs_data = payload.get("observation", {})
     return {
-        "observation": obs_dict,
-        "reward": obs.reward,
-        "done": obs.done,
-        "metadata": obs.metadata,
+        "observation": obs_data,
+        "reward": payload.get("reward", 0.0),
+        "done": payload.get("done", False),
+        "metadata": obs_data.get("metadata") or payload.get("metadata", {}),
+    }
+
+
+def env_step(session: requests.Session, action: Dict) -> Dict:
+    """POST /step to the environment server and return the parsed result."""
+    resp = session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+    obs_data = payload.get("observation", {})
+    return {
+        "observation": obs_data,
+        "reward": payload.get("reward", 0.0),
+        "done": payload.get("done", False),
+        "metadata": obs_data.get("metadata") or payload.get("metadata", {}),
     }
 
 
@@ -156,7 +213,13 @@ def sanitize_action(raw: Dict) -> Dict:
 
 
 def simulate_customer(client: OpenAI, task_id: str, agent_message: str, missing_slots: List[str]) -> str:
-    """LLM call simulating a customer who responds with the required slot values."""
+    """LLM call simulating a customer who responds with the required slot values.
+
+    When STOCHASTIC_NOISE is enabled, the simulated customer may:
+    - Omit some requested information (forcing an extra clarification turn)
+    - Add irrelevant tangents or emotional outbursts
+    - Provide ambiguous or partial answers
+    """
     if not missing_slots or not agent_message:
         return ""
 
@@ -169,17 +232,29 @@ def simulate_customer(client: OpenAI, task_id: str, agent_message: str, missing_
         "incident_count": "a count like 3",
         "payroll_date": "a date like 2024-03-15",
     }
+
+    # Stochastic noise: sometimes the customer doesn't cooperate fully
+    noise_instruction = ""
+    if STOCHASTIC_NOISE and random.random() < 0.25:
+        noise_type = random.choice([
+            "Omit one of the requested details and say you'll look it up. Add a complaint about wait times.",
+            "Provide the information but also go on a brief emotional tangent about how stressed you are.",
+            "Give a slightly ambiguous answer for one detail (e.g., 'I think it was around $50' instead of exact amount).",
+        ])
+        noise_instruction = f"\nBehavior twist: {noise_type}\n"
+
     slot_desc = ", ".join(f"{s} ({slot_hints.get(s, s)})" for s in missing_slots)
 
     prompt = (
         f"You are a customer calling fintech support about: {task_id.replace('_', ' ')}.\n"
         f"The agent just said: \"{agent_message}\"\n\n"
         f"Respond naturally as a concerned customer. Include these details in your reply: {slot_desc}.\n"
+        f"{noise_instruction}"
         "Keep it to 1-3 sentences."
     )
     msg = client.chat.completions.create(
         model=MODEL_NAME,
-        temperature=0.3,
+        temperature=0.4 + (0.3 * random.random() if STOCHASTIC_NOISE else 0.0),
         max_tokens=150,
         messages=[
             {"role": "system", "content": "You are simulating a fintech customer. Respond naturally with the requested information."},
@@ -325,7 +400,7 @@ def llm_action(client: OpenAI, prompt: str) -> Dict:
         }
 
 
-def run_trajectory(client: OpenAI, task_id: str) -> float:
+def run_trajectory(client: OpenAI, task_id: str, http_session: requests.Session) -> float:
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
@@ -334,51 +409,25 @@ def run_trajectory(client: OpenAI, task_id: str) -> float:
     log_start(task_id, MODEL_NAME)
 
     try:
-        env = CustomerRelationshipEnvironment()
-        obs = env.reset(task_id=task_id)
-        last = obs_to_dict(obs)
+        last = env_reset(http_session, task_id)
         customer_reply = ""
 
         for step_num in range(1, MAX_STEPS + 1):
             err_str = None
+            raw_action: Dict = {}
             try:
                 prompt = build_prompt(last, task_id, customer_reply)
                 raw_action = sanitize_action(llm_action(client, prompt))
                 act_str = raw_action.get("action_type", "unknown")
 
-                try:
-                    action = CRMAction.model_validate(raw_action)
-                except Exception:
-                    # Fallback: build a safe action so the trajectory continues
-                    ob = last.get("observation", {})
-                    missing = [s for s in ob.get("required_slots", [])
-                               if s not in ob.get("collected_slots", {})]
-                    fallback_type = "respond" if missing else "workflow"
-                    action = CRMAction.model_validate({
-                        "action_type": fallback_type,
-                        "rationale": "Fallback after validation error",
-                        "response_text": raw_action.get("response_text", "")
-                            if isinstance(raw_action.get("response_text"), str)
-                            else "Let me verify your details to proceed securely.",
-                        "intent": raw_action.get("intent", ""),
-                        "workflow": "verify_identity" if fallback_type == "workflow" else "none",
-                        "extracted_slots": raw_action.get("extracted_slots", {})
-                            if isinstance(raw_action.get("extracted_slots"), dict) else {},
-                        "confidence": 0.5,
-                        "event_type": "auth_checkpoint",
-                        "tool_status": "ok",
-                    })
-                    act_str = fallback_type
-
-                obs = env.step(action)
-                last = obs_to_dict(obs)
+                last = env_step(http_session, raw_action)
 
                 reward = float(last.get("reward", 0.0))
                 done = bool(last.get("done", False))
             except Exception as ex:
                 reward = 0.0
                 done = True
-                act_str = raw_action.get("action_type", "unknown") if 'raw_action' in dir() else "error"
+                act_str = raw_action.get("action_type", "unknown") if raw_action else "error"
                 err_str = str(ex)[:50]
 
             rewards.append(reward)
@@ -421,12 +470,22 @@ def run_trajectory(client: OpenAI, task_id: str) -> float:
 def main() -> None:
     require_env()
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    http_session = requests.Session()
+
+    # Verify environment server is reachable
+    try:
+        health = http_session.get(f"{ENV_BASE_URL}/health", timeout=5)
+        health.raise_for_status()
+    except Exception as e:
+        print(f"WARNING: Environment server at {ENV_BASE_URL} not reachable: {e}", file=sys.stderr)
+        print("Set ENV_BASE_URL to the running server address.", file=sys.stderr)
+        sys.exit(1)
 
     all_scores: List[float] = []
     for task in TASKS:
         task_scores: List[float] = []
         for i in range(TRAJECTORIES_PER_TASK):
-            score = run_trajectory(client, task)
+            score = run_trajectory(client, task, http_session)
             task_scores.append(score)
             print(f"task={task} traj={i+1} score={score:.4f}")
         mean_task = sum(task_scores) / len(task_scores)

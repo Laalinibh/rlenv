@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Run smoke tests
+        run: python tests_smoke.py
+
+      - name: Validate openenv config
+        run: openenv validate --verbose
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t crm-env:test .
+
+      - name: Start container and health check
+        run: |
+          docker run -d --name crm-test -p 7860:7860 crm-env:test
+          sleep 5
+          curl -f http://localhost:7860/health
+          docker stop crm-test

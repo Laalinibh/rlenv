@@ -153,8 +153,22 @@ class CustomerRelationshipEnvironment(Environment):
         if action.tool_status in {"failed", "timeout"}:
             self._tool_failures += 1
             reward -= 0.06
-        if "sorry" in action.response_text.lower() or "correct" in action.response_text.lower():
-            self._repair_loops += 1
+
+        # Repair loop detection: structural signals, not keyword matching.
+        # A repair loop is when the agent repeats the same action type as the
+        # previous turn without advancing the conversation (no new slots, no
+        # new workflow, same action type as last turn).
+        if len(self._history) >= 3:
+            prev_turns = [h for h in self._history if h["role"] == "agent"]
+            if len(prev_turns) >= 2:
+                # Same text repeated nearly verbatim indicates a loop
+                current_text = action.response_text.strip().lower()
+                prev_text = prev_turns[-2]["text"].strip().lower()
+                if current_text and prev_text and (
+                    current_text == prev_text
+                    or (len(current_text) > 20 and current_text[:20] == prev_text[:20])
+                ):
+                    self._repair_loops += 1
 
         # Compliance-awareness tracking
         if action.event_type == CriticalEventType.COMPLIANCE_DISCLOSURE:
@@ -305,8 +319,9 @@ class CustomerRelationshipEnvironment(Environment):
         # Contains specific numbers, dates, or IDs (shows specificity)
         if any(c.isdigit() for c in action.response_text):
             clarity += 0.3
-        # Uses structured sentence patterns
-        if any(p in text for p in ["i will", "i'll", "let me", "here's what", "first,"]):
+        # Structural signals: sentences > 1 indicate organized response
+        sentence_count = max(1, action.response_text.count('.') + action.response_text.count('?'))
+        if 2 <= sentence_count <= 5:
             clarity += 0.3
         clarity = min(2.0, clarity)
 
@@ -314,8 +329,11 @@ class CustomerRelationshipEnvironment(Environment):
         actionability = 0.4
         if action.action_type in (CRMActionType.WORKFLOW, CRMActionType.FINALIZE):
             actionability += 0.8  # concrete action
-        if any(k in text for k in ["next step", "please provide", "confirm", "verify", "process"]):
-            actionability += 0.4
+        # Asking questions or providing information moves things forward
+        if action.response_text.count('?') >= 1 and action.action_type == CRMActionType.RESPOND:
+            actionability += 0.4  # soliciting information
+        elif action.action_type == CRMActionType.ANALYZE:
+            actionability += 0.4  # diagnostic action
         if action.confidence >= 0.7:
             actionability += 0.2
         # Penalize vague/empty responses
