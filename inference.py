@@ -163,7 +163,7 @@ def env_reset(session: requests.Session, task_id: str) -> Dict:
 
 def env_step(session: requests.Session, action: Dict) -> Dict:
     """POST /step to the environment server and return the parsed result."""
-    resp = session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
+    resp = session.post(f"{ENV_BASE_URL}/step", json={"action": action}, timeout=30)
     resp.raise_for_status()
     payload = resp.json()
     obs_data = payload.get("observation", {})
